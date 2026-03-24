@@ -1,6 +1,6 @@
 # TCP Congestion Control Visualisations
 
-Python simulations that plot **congestion window (cwnd) over time** for four
+Python simulations that plot **congestion window (cwnd) over time** for five
 TCP congestion control algorithms. Each script is self-contained and produces
 a labelled matplotlib figure saved as a PNG alongside a per-RTT summary table
 printed to stdout.
@@ -13,6 +13,7 @@ printed to stdout.
 | `newreno/` | `tcp_newreno.py` | Loss-based | RFC 6582 |
 | `vegas/` | `tcp_vegas.py` | Delay-based | Brakmo & Peterson 1994 |
 | `cubic/` | `tcp_cubic.py` | Loss-based (cubic) | RFC 9438 |
+| `highspeed/` | `tcp_highspeed.py` | Loss-based (state-dependent AIMD) | RFC 3649 |
 
 ## Algorithm summaries
 
@@ -68,15 +69,34 @@ K = ∛(W_max × β / C)
 CUBIC is more aggressive than Reno on high-bandwidth, high-RTT paths (large
 BDP) because the cubic curve recovers lost throughput much faster.
 
+### TCP HighSpeed (HSTCP, RFC 3649)
+Designed for high-bandwidth, high-RTT paths where Reno's fixed +1 MSS/RTT
+growth is far too slow. HSTCP uses **cwnd-dependent AIMD parameters**:
+
+```
+cwnd ≤ LOW_WINDOW  :  a(w) = 1,   keep(w) = 50%   ← identical to Reno
+cwnd ≥ HIGH_WINDOW :  a(w) = 12,  keep(w) = 85%   ← 12× faster growth, only 15% cut
+```
+
+Parameters are log-interpolated between the two extremes.
+
+- **Additive increase**: `cwnd += a(w)` per RTT — up to 12 MSS/RTT at high windows.
+- **Fast Retransmit**: `ssthresh = cwnd × keep(w)` — much softer than Reno's 50% halving.
+- **RTO**: `ssthresh = cwnd/2`, `cwnd = 1` — same hard reset as Reno.
+
+The plot overlays a TCP Reno reference line (same loss events) so the
+throughput advantage of HSTCP is directly visible. The `a(w)` value in effect
+is annotated along the HSTCP cwnd line.
+
 ## Comparison at a glance
 
-| Property | Reno | New Reno | Vegas | CUBIC |
-|---|---|---|---|---|
-| Growth (cong. avoid.) | Linear +1/RTT | Linear +1/RTT | ±1 based on diff | Cubic in time |
-| Reacts to | Packet loss | Packet loss | RTT increase | Packet loss |
-| Loss penalty | cwnd/2 | cwnd/2 | cwnd/2 | cwnd × 0.7 |
-| Multi-loss recovery | Poor | Good | N/A (rare loss) | Good |
-| High-BDP performance | Poor | Poor | Moderate | Excellent |
+| Property | Reno | New Reno | Vegas | CUBIC | HSTCP |
+|---|---|---|---|---|---|
+| Growth (cong. avoid.) | +1/RTT | +1/RTT | ±1 (diff) | Cubic in time | +a(w)/RTT |
+| Reacts to | Loss | Loss | RTT increase | Loss | Loss |
+| Loss penalty | cwnd/2 | cwnd/2 | cwnd/2 | cwnd × 0.7 | cwnd × (1−keep(w)) |
+| Multi-loss recovery | Poor | Good | N/A | Good | Good |
+| High-BDP performance | Poor | Poor | Moderate | Excellent | Excellent |
 
 ## Requirements
 
@@ -92,7 +112,8 @@ Run any script from its own directory (the PNG is saved there):
 cd reno   && python tcp_reno.py
 cd newreno && python tcp_newreno.py
 cd vegas   && python tcp_vegas.py
-cd cubic   && python tcp_cubic.py
+cd cubic      && python tcp_cubic.py
+cd highspeed  && python tcp_highspeed.py
 ```
 
 Each script prints a per-RTT table of `cwnd`, `ssthresh`, and phase, then
