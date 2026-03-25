@@ -1,157 +1,239 @@
+#!/usr/bin/env python3
 """
-TCP CUBIC congestion window simulation.
+TCP CUBIC Congestion Window Simulation  —  RFC 9438
 
-CUBIC window function:
-    W_cubic(t) = C * (t - K)^3 + W_max
-    K = cbrt(W_max * beta / C)
+CUBIC replaces the linear Congestion Avoidance ramp with a cubic function of
+time elapsed since the last loss event:
 
-After congestion: W_max = cwnd, cwnd *= (1 - beta)
+  W_cubic(t) = C × (t − K)³ + W_max
+  K          = ∛(W_max × β / C)
 
-This script is set up to show the inflection point of the CUBIC curve.
-Inflection is at t_epoch = K (where W_cubic = W_max).
-Left of K: concave-down (decelerating, probing toward W_max).
-Right of K: concave-up (accelerating, overshooting W_max).
+where W_max is the cwnd at which the last loss occurred, t is the time (RTTs)
+since the loss, and K is the time at which W_cubic returns to W_max (the
+inflection point).
+
+Shape of the S-curve
+--------------------
+  t < K  (left of inflection)  : concave-down  — fast initial probe toward W_max
+  t = K                        : inflection    — cwnd = W_max again
+  t > K  (right of inflection) : concave-up    — aggressive growth past W_max
+
+This is more efficient than Reno's linear ramp on high-BDP paths because
+CUBIC recovers lost throughput quickly after a loss event.
+
+On loss
+-------
+  Fast Retransmit : W_max = cwnd,  cwnd = W_max × (1−β),  K recomputed
+  RTO (Timeout)   : ssthresh = cwnd/2,  cwnd = 1  (same hard reset as Reno)
+
+Parameters
+----------
+C       : cubic scaling constant (MSS/RTT³)
+BETA    : reduction factor on loss (0.3 = 30% cut, vs Reno's 50%)
 """
 
+import math
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import numpy as np
 
-# --- Parameters ---
-C = 0.4           # CUBIC scaling constant
-BETA = 0.7        # multiplicative decrease factor (0.7 = 30% reduction)
-RTT = 0.01        # RTT in seconds (10 ms)
-INITIAL_CWND = 10 # initial cwnd in segments (MSS units)
-MSS = 1           # 1 segment unit
-MAX_CWND = 2000   # cap to keep simulation finite
-SIM_DURATION = 12 # seconds — long enough to pass the inflection point
+# ─── Simulation parameters ────────────────────────────────────────────────────
+INIT_CWND     = 1      # MSS
+INIT_SSTHRESH = 32     # MSS
+C             = 0.015  # cubic scaling constant  (MSS / RTT³)
+BETA          = 0.3    # multiplicative decrease  (30% cut on loss)
 
-# Single congestion event so we can clearly see the full CUBIC S-curve
-CONGESTION_EVENTS = [1.0]
+FAST_RX_RTT   = 22     # RTT where 3 dup-ACKs trigger fast retransmit
+RTO_RTT       = 40     # RTT where RTO fires
+TOTAL_RTTS    = 60
+# ─────────────────────────────────────────────────────────────────────────────
+
+SLOW_START = "Slow Start"
+CUBIC_CA   = "CUBIC Cong. Avoidance"
 
 
 def cubic_K(w_max):
+    """RTTs from post-loss cwnd back up to W_max (inflection point time)."""
     return (w_max * BETA / C) ** (1.0 / 3.0)
 
 
-def cubic_w(t, w_max, K):
-    return C * (t - K) ** 3 + w_max
+def w_cubic(t_epoch, w_max, k):
+    """CUBIC window target at t_epoch RTTs after the last loss."""
+    return C * (t_epoch - k) ** 3 + w_max
+
+
+def init_cubic_from_ss(cwnd):
+    """
+    Initialise CUBIC state when entering congestion avoidance from slow start.
+    Uses a 'virtual prior loss' so that W_cubic(0) == cwnd, giving us
+    the full S-curve (concave-down probe toward W_max, then past it).
+    """
+    vm = cwnd / (1.0 - BETA)   # virtual W_max such that W_cubic(0) = cwnd
+    k  = cubic_K(vm)
+    return vm, k, 0.0           # (w_max, K, t_epoch)
 
 
 def simulate():
-    times = []
-    cwnds = []
-    event_times = []
-    # Track state at the last congestion event for post-hoc annotation
-    last_event_state = {}  # {t_event: (w_max, K)}
+    cwnd     = float(INIT_CWND)
+    ssthresh = float(INIT_SSTHRESH)
+    state    = SLOW_START
 
-    cwnd = float(INITIAL_CWND)
-    w_max = cwnd
-    t = 0.0
-    congestion_queue = sorted(CONGESTION_EVENTS)
+    w_max, K, t_epoch = 0.0, 0.0, 0.0
 
-    t_epoch = 0.0
-    K = cubic_K(w_max)
+    times, cwnds, ssthreshs, phases = [], [], [], []
+    event_rtts      = {}
+    inflections     = {}    # fractional RTT -> (W_max value, annotation text)
 
-    dt = RTT
-
-    while t <= SIM_DURATION:
+    for t in range(TOTAL_RTTS):
+        # Record state at start of this RTT
         times.append(t)
         cwnds.append(cwnd)
+        ssthreshs.append(ssthresh)
+        phases.append(state)
 
-        if congestion_queue and t >= congestion_queue[0]:
-            congestion_queue.pop(0)
-            event_times.append(t)
-            w_max = cwnd
-            cwnd = max(cwnd * (1 - BETA), 1.0)
-            t_epoch = 0.0
-            K = cubic_K(w_max)
-            last_event_state[t] = (w_max, K)
+        # ── Loss events ──────────────────────────────────────────────────────
+        if t == FAST_RX_RTT:
+            w_max    = cwnd
+            ssthresh = max(cwnd * (1.0 - BETA), 2.0)
+            cwnd     = ssthresh              # = W_max × (1−β)
+            K        = cubic_K(w_max)
+            t_epoch  = 0.0
+            state    = CUBIC_CA
+            event_rtts[t] = "Fast Retransmit\n(3 dup-ACKs)"
+            t_infl = t + K
+            if t_infl < TOTAL_RTTS:
+                inflections[t_infl] = (w_max, f"inflection\nW_max={w_max:.0f}")
 
-        t += dt
-        t_epoch += dt
+        elif t == RTO_RTT:
+            ssthresh = max(cwnd / 2.0, 2.0)
+            cwnd     = float(INIT_CWND)
+            state    = SLOW_START
+            event_rtts[t] = "RTO\n(Timeout)"
 
-        w_cubic = cubic_w(t_epoch, w_max, K)
-
-        if w_cubic < cwnd:
-            cwnd += MSS / cwnd
+        # ── Normal per-RTT update ────────────────────────────────────────────
         else:
-            cwnd += (w_cubic - cwnd) / cwnd
+            if state == SLOW_START:
+                cwnd = min(cwnd * 2.0, ssthresh)
+                if cwnd >= ssthresh:
+                    w_max, K, t_epoch = init_cubic_from_ss(cwnd)
+                    state = CUBIC_CA
+                    t_infl = t + K
+                    if t_infl < TOTAL_RTTS:
+                        inflections[t_infl] = (w_max, f"inflection\nW_max={w_max:.0f}")
 
-        cwnd = min(cwnd, MAX_CWND)
+            elif state == CUBIC_CA:
+                t_epoch += 1.0
+                target = w_cubic(t_epoch, w_max, K)
+                # Take the max with Reno-like +1/RTT (TCP-friendliness)
+                cwnd = max(target, cwnd + 1.0)
 
-    return np.array(times), np.array(cwnds), event_times, last_event_state
+    return times, cwnds, ssthreshs, phases, event_rtts, inflections
 
 
-def plot(times, cwnds, event_times, last_event_state):
-    fig, ax = plt.subplots(figsize=(12, 6))
+def collect_phase_spans(times, phases):
+    spans, start = [], 0
+    for i in range(1, len(phases)):
+        if phases[i] != phases[i - 1]:
+            spans.append((times[start], times[i - 1] + 1, phases[i - 1]))
+            start = i
+    spans.append((times[start], times[-1] + 1, phases[-1]))
+    return spans
 
-    ax.plot(times, cwnds, color="steelblue", linewidth=1.8, label="simulated cwnd", zorder=3)
 
-    # Overlay theoretical W_cubic curve after each congestion event
-    for et, (w_max, K) in last_event_state.items():
-        t_range = np.linspace(0, SIM_DURATION - et, 2000)
-        w_theory = cubic_w(t_range, w_max, K)
-        w_theory = np.clip(w_theory, 0, MAX_CWND)
-        ax.plot(
-            et + t_range, w_theory,
-            color="orange", linewidth=1.2, linestyle="--",
-            label="W_cubic(t) theoretical", zorder=2,
-        )
+def plot(times, cwnds, ssthreshs, phases, event_rtts, inflections):
+    phase_colors = {
+        SLOW_START: "#cfe2ff",
+        CUBIC_CA:   "#d4edda",
+    }
+    event_colors = {
+        "Fast Retransmit\n(3 dup-ACKs)": "#e07b00",
+        "RTO\n(Timeout)":                "#cc0000",
+    }
+    annotation_offsets = {
+        FAST_RX_RTT: ( 2,  8),
+        RTO_RTT:     ( 1, 10),
+    }
 
-        # Mark W_max (horizontal reference)
-        ax.axhline(w_max, color="gray", linestyle=":", linewidth=1.0, alpha=0.7)
+    fig, ax = plt.subplots(figsize=(15, 7))
+
+    # Phase background shading
+    for start, end, phase in collect_phase_spans(times, phases):
+        ax.axvspan(start, end, alpha=0.22, color=phase_colors[phase], zorder=1)
+
+    # ssthresh dashed line
+    ax.step(times, ssthreshs, color="orangered", linewidth=1.4,
+            linestyle="--", where="post", label="ssthresh (MSS)", zorder=3)
+
+    # cwnd
+    ax.plot(times, cwnds, color="steelblue", linewidth=2.2,
+            label="cwnd (MSS)", zorder=4)
+    ax.scatter(times, cwnds, color="steelblue", s=18, zorder=5)
+
+    # Inflection point markers
+    for t_infl, (wm, label) in inflections.items():
+        ax.axvline(t_infl, color="green", linestyle="-.", linewidth=1.3,
+                   alpha=0.75, zorder=2)
+        ax.axhline(wm, color="green", linestyle=":", linewidth=0.9,
+                   alpha=0.45, zorder=2)
+        y_text = wm + max(cwnds) * 0.04
         ax.annotate(
-            f"W_max = {w_max:.0f}",
-            xy=(et + 0.2, w_max),
-            xytext=(et + 0.3, w_max + max(cwnds) * 0.03),
-            fontsize=8, color="gray",
+            label,
+            xy=(t_infl, wm),
+            xytext=(t_infl + 0.6, y_text),
+            fontsize=8, color="green",
+            arrowprops=dict(arrowstyle="->", color="green", lw=1.1),
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="green", alpha=0.85),
+            zorder=6,
         )
 
-        # Mark inflection point at t_epoch = K  →  W_cubic(K) = W_max
-        t_inflection = et + K
-        if t_inflection <= SIM_DURATION:
-            ax.axvline(t_inflection, color="green", linestyle="-.", linewidth=1.3, alpha=0.8)
-            ax.annotate(
-                f"inflection\n(t={t_inflection:.2f}s, W=W_max)",
-                xy=(t_inflection, w_max),
-                xytext=(t_inflection + 0.2, w_max - max(cwnds) * 0.12),
-                fontsize=8, color="green",
-                arrowprops=dict(arrowstyle="->", color="green", lw=1.0),
-            )
-
-    for et in event_times:
-        ax.axvline(et, color="tomato", linestyle="--", linewidth=1.2)
+    # Loss event markers
+    for rtt, label in event_rtts.items():
+        color = event_colors[label]
+        ax.axvline(rtt, color=color, linestyle=":", linewidth=1.8, zorder=2)
+        dx, dy = annotation_offsets.get(rtt, (1, 6))
         ax.annotate(
-            "loss / MD",
-            xy=(et, 0),
-            xytext=(et + 0.1, max(cwnds) * 0.04),
-            color="tomato", fontsize=8,
+            label,
+            xy=(rtt, cwnds[rtt]),
+            xytext=(rtt + dx, cwnds[rtt] + dy),
+            fontsize=9, color=color, fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=color, lw=1.4),
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.88),
+            zorder=6,
         )
 
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("cwnd (segments)")
-    ax.set_title("TCP CUBIC — Congestion Window over Time\n"
-                 "Left of inflection: concave-down (slow probe).  "
-                 "Right of inflection: concave-up (fast growth).")
-    ax.set_xlim(0, SIM_DURATION)
-    ax.set_ylim(0)
-    ax.grid(True, linestyle=":", alpha=0.4)
+    # Legend
+    ss_patch = mpatches.Patch(color=phase_colors[SLOW_START], alpha=0.6,
+                               label="Slow Start phase")
+    ca_patch = mpatches.Patch(color=phase_colors[CUBIC_CA],   alpha=0.6,
+                               label="CUBIC Cong. Avoidance phase")
+    handles, _ = ax.get_legend_handles_labels()
+    ax.legend(handles=handles + [ss_patch, ca_patch],
+              loc="upper left", fontsize=9, framealpha=0.9)
 
-    # Deduplicate legend entries
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc="upper left")
-
-    K_val = list(last_event_state.values())[-1][1] if last_event_state else "n/a"
-    param_text = (
-        f"C={C}  β={BETA}  RTT={int(RTT*1000)} ms  "
-        f"init_cwnd={INITIAL_CWND}  "
-        f"K={K_val:.2f}s  (inflection at t_epoch=K)"
+    # Parameter info box
+    info = (
+        f"Init cwnd = {INIT_CWND} MSS,  ssthresh = {INIT_SSTHRESH} MSS\n"
+        f"C = {C}  (cubic scaling, MSS/RTT³)\n"
+        f"β = {BETA}  (30% reduction on loss vs Reno's 50%)\n"
+        f"W_cubic(t) = C·(t−K)³ + W_max\n"
+        f"Fast Retransmit @ RTT {FAST_RX_RTT}\n"
+        f"RTO             @ RTT {RTO_RTT}"
     )
-    fig.text(0.5, 0.01, param_text, ha="center", fontsize=8, color="gray")
+    ax.text(0.99, 0.03, info, transform=ax.transAxes, fontsize=8,
+            va="bottom", ha="right",
+            bbox=dict(boxstyle="round", fc="lightyellow", ec="gray", alpha=0.85))
 
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    ax.set_xlabel("Time (RTT)", fontsize=12)
+    ax.set_ylabel("Congestion Window (MSS)", fontsize=12)
+    ax.set_title(
+        "TCP CUBIC — Congestion Window over Time\n"
+        "Green dash-dot = inflection point (t=K, cwnd returns to W_max)",
+        fontsize=13, fontweight="bold"
+    )
+    ax.set_xlim(0, TOTAL_RTTS - 1)
+    ax.set_ylim(0, max(cwnds) * 1.25)
+    ax.grid(True, linestyle="--", alpha=0.35)
+
+    plt.tight_layout()
     out = "tcp_cubic_cwnd.png"
     plt.savefig(out, dpi=150)
     print(f"Saved: {out}")
@@ -159,5 +241,14 @@ def plot(times, cwnds, event_times, last_event_state):
 
 
 if __name__ == "__main__":
-    times, cwnds, event_times, last_event_state = simulate()
-    plot(times, cwnds, event_times, last_event_state)
+    times, cwnds, ssthreshs, phases, event_rtts, inflections = simulate()
+
+    print(f"{'RTT':>4}  {'cwnd':>7}  {'ssthresh':>8}  {'phase'}")
+    print("-" * 50)
+    for t, c, s, p in zip(times, cwnds, ssthreshs, phases):
+        mark = ""
+        if t in event_rtts:
+            mark = " <-- " + event_rtts[t].replace("\n", " ")
+        print(f"{t:>4}  {c:>7.1f}  {s:>8.1f}  {p}{mark}")
+
+    plot(times, cwnds, ssthreshs, phases, event_rtts, inflections)
