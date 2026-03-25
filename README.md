@@ -1,6 +1,6 @@
 # TCP Congestion Control Visualisations
 
-Python simulations that plot **congestion window (cwnd) over time** for five
+Python simulations that plot **congestion window (cwnd) over time** for six
 TCP congestion control algorithms. Each script is self-contained and produces
 a labelled matplotlib figure saved as a PNG alongside a per-RTT summary table
 printed to stdout.
@@ -14,6 +14,7 @@ printed to stdout.
 | `vegas/` | `tcp_vegas.py` | Delay-based | Brakmo & Peterson 1994 |
 | `cubic/` | `tcp_cubic.py` | Loss-based (cubic) | RFC 9438 |
 | `highspeed/` | `tcp_highspeed.py` | Loss-based (state-dependent AIMD) | RFC 3649 |
+| `bbr/` | `tcp_bbr.py` | Model-based (bandwidth + RTT) | Google 2016 |
 
 ## Algorithm summaries
 
@@ -90,13 +91,38 @@ is annotated along the HSTCP cwnd line.
 
 ## Comparison at a glance
 
-| Property | Reno | New Reno | Vegas | CUBIC | HSTCP |
-|---|---|---|---|---|---|
-| Growth (cong. avoid.) | +1/RTT | +1/RTT | ±1 (diff) | Cubic in time | +a(w)/RTT |
-| Reacts to | Loss | Loss | RTT increase | Loss | Loss |
-| Loss penalty | cwnd/2 | cwnd/2 | cwnd/2 | cwnd × 0.7 | cwnd × (1−keep(w)) |
-| Multi-loss recovery | Poor | Good | N/A | Good | Good |
-| High-BDP performance | Poor | Poor | Moderate | Excellent | Excellent |
+### TCP BBR (Google 2016)
+A **model-based** algorithm that estimates two network properties and sets
+cwnd directly from them — without reacting to loss at all.
+
+```
+BtlBW   = windowed max of delivery rate   (bottleneck bandwidth)
+RTprop  = windowed min of RTT             (propagation delay)
+cwnd   ≈ BtlBW × RTprop                  (= BDP, just fills the pipe)
+```
+
+BBR cycles through four states:
+
+| State | Behaviour |
+|---|---|
+| **Startup** | Double pacing rate each RTT until BtlBW plateaus (3 rounds) |
+| **Drain** | Drain queue built in Startup; pacing_gain = 1/2 |
+| **ProbeBW** | Steady state — 8-RTT gain cycle `[1.25, 0.75, 1.0×6]` probes BW |
+| **ProbeRTT** | Every ~24 RTTs, cwnd → 4 MSS for 2 RTTs to measure clean RTprop |
+
+The plot overlays the **BDP estimate** (orange dashed) to show BBR learning
+the network, and annotates the `×1.25` / `×0.75` pacing gain at probe rounds.
+There is no sawtooth — cwnd hugs the BDP with ±25 % oscillation.
+
+## Comparison at a glance
+
+| Property | Reno | New Reno | Vegas | CUBIC | HSTCP | BBR |
+|---|---|---|---|---|---|---|
+| Growth | +1/RTT | +1/RTT | ±1 (diff) | Cubic | +a(w)/RTT | tracks BDP |
+| Reacts to | Loss | Loss | RTT increase | Loss | Loss | **nothing** |
+| Loss penalty | cwnd/2 | cwnd/2 | cwnd/2 | ×0.7 | ×(1−keep) | none |
+| Sawtooth | Yes | Yes | No | Yes | Yes | No |
+| High-BDP | Poor | Poor | Moderate | Excellent | Excellent | Excellent |
 
 ## Requirements
 
@@ -114,6 +140,7 @@ cd newreno && python tcp_newreno.py
 cd vegas   && python tcp_vegas.py
 cd cubic      && python tcp_cubic.py
 cd highspeed  && python tcp_highspeed.py
+cd bbr        && python tcp_bbr.py
 ```
 
 Each script prints a per-RTT table of `cwnd`, `ssthresh`, and phase, then
