@@ -44,13 +44,14 @@ import matplotlib.patches as mpatches
 # ─── Simulation parameters ────────────────────────────────────────────────────
 INIT_CWND     = 1      # MSS
 INIT_SSTHRESH = 32     # MSS
-C             = 0.4    # cubic scaling constant  (MSS / s³, RFC 9438 default)
+C             = 4.0    # cubic scaling constant  (MSS / s³); RFC 9438 default is 0.4,
+                       # scaled 10× here so the superlinear phase is visible in simulation
 BETA          = 0.3    # multiplicative decrease  (30% cut on loss vs Reno's 50%)
 RTT_SEC       = 0.1    # assumed RTT in seconds (100 ms)
 
-FAST_RX_RTT   = 22     # RTT tick where 3 dup-ACKs trigger fast retransmit
-RTO_RTT       = 40     # RTT tick where RTO fires
-TOTAL_RTTS    = 60
+FAST_RX_RTT   = 50     # RTT tick where 3 dup-ACKs trigger fast retransmit
+RTO_RTT       = 100    # RTT tick where RTO fires
+TOTAL_RTTS    = 130
 # ─────────────────────────────────────────────────────────────────────────────
 
 SLOW_START = "Slow Start"
@@ -222,7 +223,7 @@ def plot(times, cwnds, ssthreshs, phases, event_rtts, inflections):
     # Parameter info box
     info = (
         f"Init cwnd = {INIT_CWND} MSS,  ssthresh = {INIT_SSTHRESH} MSS\n"
-        f"C = {C}  (cubic scaling, MSS/s³, RFC 9438)\n"
+        f"C = {C}  (cubic scaling, MSS/s³; RFC default 0.4, scaled 10× for visibility)\n"
         f"β = {BETA}  (30% reduction on loss vs Reno's 50%)\n"
         f"RTT = {RTT_SEC*1000:.0f} ms  (assumed fixed)\n"
         f"W_cubic(t) = C·(t−K)³ + W_max  [t in seconds]\n"
